@@ -1,98 +1,97 @@
-# BugBounty Auto-Recon
+# BugBounty Auto-Recon v3.3
 
 ## Быстрый старт
 
 ```bash
-# 1. Клонировать
 git clone https://github.com/QtZf-Ex/BB && cd BB
 chmod +x recon.sh
-
-# 2. Установить зависимости
 ./recon.sh --install
 
-# 3. Вписать Telegram токен в recon.sh (строки 47-48)
-nano recon.sh
+# Вставь в recon.sh строки 52-53:
 # TG_BOT_TOKEN="..."
 # TG_CHAT_ID="..."
 
-# 4. Тест Telegram
 ./recon.sh --test-tg
-
-# 5. Запуск
 ./recon.sh -d target.com
 ```
 
-## Telegram Bot (управление из телефона)
+## Что исправлено в v3.3
+
+| Проблема | Причина | Исправление |
+|---|---|---|
+| Live Hosts = 0 | httpx сканировал только `:80/:443`, nginx на `:8443` не попадал | httpx теперь сканирует **все IP:PORT** из naabu |
+| nmap XML пустой | nmap не запускался: `nmap_targets.txt` был пуст | nmap запускается на **ВСЕ хосты** с любыми открытыми портами |
+| Interesting ports = 0 | фильтр искал только конкретные порты, naabu нашёл другие | Interesting = **все порты кроме 80/443** |
+| Нет attack URLs | отчёт не давал готовых URL для Burp | Новый файл **`attack_urls.txt`** + раздел в отчёте |
+
+## Telegram Bot v2.0
 
 ```bash
-# Установить зависимости бота
-pip install python-telegram-bot --break-system-packages
+pip install python-telegram-bot apscheduler --break-system-packages
 
-# Заполнить в bot.py:
+# Заполни в bot.py:
 # BOT_TOKEN = "..."
-# AUTHORIZED_USERS = [123456789]
+# AUTHORIZED_USERS = [123456789]  # @userinfobot
 
-# Запустить
 python3 bot.py
 ```
 
-### Возможности бота
-- Создавать программы bug bounty (группы доменов)
-- Добавлять/удалять домены из бота
-- Настраивать HTTP заголовки на программу (Authorization, Cookie...)
-- Настраивать rate limit на программу
-- Запускать/останавливать сканирования
-- Получать отчёты в Telegram
+### Как добавить домены (UX fix)
+1. `/start` → **➕ Новая программа**
+2. Введи название: `hackerone_target`
+3. **Автоматически** предлагается ввести первый домен
+4. Введи: `target.com` → добавить ещё или идти к сканированию
+5. **▶️ Скан**
 
-## Опции recon.sh
-
+### Cron — автоматическое сканирование
 ```
--d, --domain DOMAIN      Целевой домен
--o, --output DIR         Папка результатов
--t, --threads N          Потоки (default: 30)
---headers-file FILE      Файл с HTTP заголовками
---deep                   Глубокий режим
---only-passive           Только Phase 1
---install                Установить зависимости
---test-tg                Тест Telegram
+/start → 🕐 Cron → выбери программу → введи интервал в часах
 ```
+Пример: 24 = скан раз в сутки автоматически
 
-## Файл заголовков
+## Структура отчёта
 
 ```
-# headers.txt — один заголовок на строку
-Authorization: Bearer xxxxxxxxxxxxxxxx
-X-Bug-Bounty: @yourusername
-Cookie: session=abc123
+## Все открытые порты          <- ВСЕ порты из naabu
+## Attack URLs                  <- Готовые URLs для Burp
+## Live Hosts & Technologies    <- httpx с технологиями
+## Open Ports & Service Versions <- nmap версии сервисов
 ```
+
+## Заголовки против блокировки
 
 ```bash
+# Создать файл headers.txt:
+Authorization: Bearer TOKEN
+X-Bug-Bounty: @yourusername
+Cookie: session=abc123
+
+# Запуск с заголовками:
 ./recon.sh -d target.com --headers-file headers.txt
+
+# Через бот:
+# Программа → 🔑 Заголовки → ➕ Добавить
 ```
 
-## Структура результатов
+## Файлы результатов
 
 ```
 ~/recon-results/target.com/TIMESTAMP/
-├── passive/          # crt.sh, subfinder, wayback
-├── active/           # httpx, naabu, nmap XML
-├── surface/          # ffuf, исторические URL, CORS
-├── js/               # JS files, secrets
-├── vulns/            # nuclei findings
+├── passive/
+│   ├── all_subs_raw.txt     # все субдомены
+│   └── wayback_urls.txt     # исторические URL
+├── active/
+│   ├── open_ports.txt       # ВСЕ открытые порты
+│   ├── interesting_ports.txt # нестандартные порты
+│   ├── attack_urls.txt      # <- ГЛАВНЫЙ ФАЙЛ ДЛЯ BURP
+│   ├── live_hosts.txt       # живые хосты
+│   └── nmap_services.xml    # версии сервисов
+├── surface/
+│   └── interesting_urls.txt
+├── js/
+│   └── js_secrets.txt
+├── vulns/
+│   └── nuclei_findings.txt
 └── reports/
-    └── summary.md    # Итоговый отчёт (включает services table)
+    └── summary.md           # полный отчёт
 ```
-
-## Что исправлено в v3.2
-
-| # | Проблема | Исправление |
-|---|---|---|
-| 1 | TG: литеральный `\n` | `printf '%b'` интерпретирует `\n` как перевод строки |
-| 2 | `grep -c \|\| echo 0` — двойной вывод | Убрали `\|\| echo 0` |
-| 3 | ffuf зависает, спам в терминал | `timeout 180` + `-rate 30` + `>/dev/null` |
-| 4 | massdns не найден | Сборка из исходников + dnsx fallback |
-| 5 | getJS не устанавливается | Заменён на `katana` (ProjectDiscovery) |
-| 6 | pip PEP 668 Debian 12 | `--break-system-packages` |
-| 7 | Ошибка line 572 | `touch` всех файлов сразу при старте |
-| NEW | Нет данных о сервисах | Парсинг httpx JSON + nmap XML в отчёт |
-| NEW | Нет поддержки заголовков | `--headers-file` + передача в httpx/ffuf/nuclei |
