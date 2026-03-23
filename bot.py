@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-BugBounty Recon Bot v2.0
+BugBounty Recon Bot v2.1
 
-Что нового:
-  - Исправлена UX: добавление доменов теперь очевидно при создании программы
-  - Cron: планировщик сканирований через бот
-  - /cron — управление расписанием
-  - Показ прогресса активных сканов
-  - Более подробный стартовый экран
+FIX v2.1:
+  - drop_pending_updates=True: не обрабатывать старые апдейты после рестарта
+  - Глобальный обработчик потерянных callback_query (кнопки от старых сессий)
+  - Команда /kill для остановки зависших сканов
+  - Явная инструкция при старте: как убить старый процесс бота
 
 Установка:
   pip install python-telegram-bot apscheduler --break-system-packages
 
 Запуск:
-  RECON_BOT_TOKEN=xxx python3 bot.py
-  # или заполни BOT_TOKEN в строке ~40
+  # ВАЖНО: убить старый процесс перед запуском!
+  pkill -f bot.py
+  python3 bot.py
 """
 
 import asyncio
 import json
 import logging
 import os
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -39,21 +38,19 @@ except ImportError:
 
 try:
     from apscheduler.schedulers.asyncio import AsyncIOScheduler
-    from apscheduler.triggers.cron import CronTrigger
     HAS_SCHEDULER = True
 except ImportError:
     HAS_SCHEDULER = False
-    print("INFO: apscheduler не установлен — cron недоступен")
+    print("INFO: apscheduler нет — cron недоступен")
     print("      pip install apscheduler --break-system-packages")
 
 # =================================================================
-#  НАСТРОЙКИ — ВСТАВЬ ДАННЫЕ СЮДА
+#  НАСТРОЙКИ
 # =================================================================
 BOT_TOKEN = os.getenv("RECON_BOT_TOKEN", "")  # <- или вставь токен сюда
 
-# ID пользователей с доступом. [] = все (только для тестов!)
 # Получи свой ID: написать @userinfobot в Telegram
-AUTHORIZED_USERS: list[int] = []  # <- например: [123456789]
+AUTHORIZED_USERS: list = []  # <- напр: [123456789]
 # =================================================================
 
 CONFIG_DIR    = Path.home() / ".config" / "recon"
@@ -74,7 +71,7 @@ logger = logging.getLogger(__name__)
     ST_ADD_HDR_KEY, ST_ADD_HDR_VAL, ST_SET_RATE, ST_SET_CRON
 ) = range(8)
 
-_active_scans: dict = {}    # key="prog:domain" -> asyncio.subprocess
+_active_scans: dict = {}
 scheduler: Optional[object] = None
 
 
@@ -125,14 +122,12 @@ def kb_main() -> InlineKeyboardMarkup:
         scanning = any(k.startswith(f"{name}:") for k in _active_scans)
         icon = "🔄" if scanning else "📁"
         rows.append([InlineKeyboardButton(
-            f"{icon} {name}  ({n_dom} доменов)", callback_data=f"P:{name}"
+            f"{icon} {name}  ({n_dom} дом.)", callback_data=f"P:{name}"
         )])
+    rows.append([InlineKeyboardButton("➕ Новая программа", callback_data="NEW")])
     rows.append([
-        InlineKeyboardButton("➕ Новая программа", callback_data="NEW"),
-    ])
-    rows.append([
-        InlineKeyboardButton("▶️ Скан всего",  callback_data="ALL"),
-        InlineKeyboardButton("🕐 Cron",        callback_data="CRONMENU"),
+        InlineKeyboardButton("▶️ Скан всего", callback_data="ALL"),
+        InlineKeyboardButton("🕐 Cron",       callback_data="CRONMENU"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -146,7 +141,7 @@ def kb_prog(name: str) -> InlineKeyboardMarkup:
     )
     prog = get_prog(name) or {}
     n_dom = len(prog.get("domains", []))
-    note = " ⚠️ нет доменов!" if n_dom == 0 else f" ({n_dom})"
+    note = " ⚠️" if n_dom == 0 else f" ({n_dom})"
     return InlineKeyboardMarkup([
         [scan_btn],
         [
@@ -154,8 +149,8 @@ def kb_prog(name: str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("🔑 Заголовки",     callback_data=f"HDR:{name}"),
         ],
         [
-            InlineKeyboardButton("⚡ Rate limit",    callback_data=f"RATE:{name}"),
-            InlineKeyboardButton("🗑 Удалить прог",  callback_data=f"DELPROG:{name}"),
+            InlineKeyboardButton("⚡ Rate limit",   callback_data=f"RATE:{name}"),
+            InlineKeyboardButton("🗑 Удалить",       callback_data=f"DELPROG:{name}"),
         ],
         [InlineKeyboardButton("◀️ Назад", callback_data="BACK")],
     ])
@@ -167,7 +162,7 @@ def kb_domains(name: str) -> InlineKeyboardMarkup:
     for d in sorted(prog.get("domains", [])):
         rows.append([
             InlineKeyboardButton(f"🌐 {d}", callback_data="NOP"),
-            InlineKeyboardButton("❌",      callback_data=f"DELD:{name}:{d}"),
+            InlineKeyboardButton("❌", callback_data=f"DELD:{name}:{d}"),
         ])
     rows.append([
         InlineKeyboardButton("➕ Добавить домен", callback_data=f"ADDD:{name}"),
@@ -183,11 +178,11 @@ def kb_headers(name: str) -> InlineKeyboardMarkup:
         short = v[:25] + "..." if len(v) > 25 else v
         rows.append([
             InlineKeyboardButton(f"{k}: {short}", callback_data="NOP"),
-            InlineKeyboardButton("❌",             callback_data=f"DELH:{name}:{k}"),
+            InlineKeyboardButton("❌", callback_data=f"DELH:{name}:{k}"),
         ])
     rows.append([
-        InlineKeyboardButton("➕ Добавить заголовок", callback_data=f"ADDH:{name}"),
-        InlineKeyboardButton("◀️ Назад",              callback_data=f"P:{name}"),
+        InlineKeyboardButton("➕ Добавить", callback_data=f"ADDH:{name}"),
+        InlineKeyboardButton("◀️ Назад",   callback_data=f"P:{name}"),
     ])
     return InlineKeyboardMarkup(rows)
 
@@ -195,14 +190,13 @@ def kb_headers(name: str) -> InlineKeyboardMarkup:
 def kb_cron() -> InlineKeyboardMarkup:
     cron_data = _load_cron()
     cfg = _load()
-    progs = sorted(cfg.get("programs", {}).keys())
     rows = []
-    for name in progs:
+    for name in sorted(cfg.get("programs", {})):
         schedule = cron_data.get(name, {})
         if schedule:
-            interval = schedule.get("interval_hours", "?")
+            h = schedule.get("interval_hours", "?")
             rows.append([InlineKeyboardButton(
-                f"🕐 {name} — каждые {interval}ч",
+                f"🕐 {name} — каждые {h}ч (нажми чтобы отключить)",
                 callback_data=f"CRONDEL:{name}"
             )])
         else:
@@ -229,28 +223,18 @@ async def _run_scan(prog_name: str, domain: str,
     prog = get_prog(prog_name) or {}
     headers_file = _make_headers_file(prog_name, prog.get("headers", {}))
     rate = prog.get("rate_limit", 30)
-
-    cmd = [
-        "bash", str(RECON_SCRIPT),
-        "-d", domain,
-        "-o", str(RESULTS_DIR),
-        "-t", str(rate),
-    ]
-    if headers_file:
-        cmd += ["--headers-file", headers_file]
-
+    cmd = ["bash", str(RECON_SCRIPT), "-d", domain,
+           "-o", str(RESULTS_DIR), "-t", str(rate)]
+    if headers_file: cmd += ["--headers-file", headers_file]
     key = f"{prog_name}:{domain}"
     try:
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"▶️ Старт: <code>{domain}</code>",
-            parse_mode="HTML"
-        )
+            text=f"▶️ Старт: <code>{domain}</code>", parse_mode="HTML")
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
+            stderr=asyncio.subprocess.DEVNULL)
         _active_scans[key] = proc
         await proc.wait()
         _active_scans.pop(key, None)
@@ -260,9 +244,7 @@ async def _run_scan(prog_name: str, domain: str,
         try:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"❌ Ошибка скана <code>{domain}</code>: {e}",
-                parse_mode="HTML"
-            )
+                text=f"❌ Ошибка: <code>{domain}</code> — {e}", parse_mode="HTML")
         except: pass
 
 
@@ -274,28 +256,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_auth(user.id):
         await update.message.reply_text("❌ Нет доступа")
         return ConversationHandler.END
-
     cfg = _load()
     progs = cfg.get("programs", {})
     total_d = sum(len(p.get("domains", [])) for p in progs.values())
-    active  = len(_active_scans)
-    cron_d  = _load_cron()
-
     text = (
-        f"<b>🕷️ BugBounty Recon Bot v2.0</b>\n"
+        f"<b>🕷️ BugBounty Recon Bot v2.1</b>\n"
         f"Привет, {user.first_name}!\n\n"
         f"📁 Программ: {len(progs)}  |  🌐 Доменов: {total_d}\n"
-        f"🔄 Активных сканов: {active}\n"
-        f"🕐 Cron расписаний: {len(cron_d)}\n\n"
+        f"🔄 Активных сканов: {len(_active_scans)}\n\n"
         f"<b>Как добавить домены:</b>\n"
-        f"1️⃣ Нажми <b>➕ Новая программа</b>\n"
-        f"2️⃣ Введи название (напр. <code>hackerone_target</code>)\n"
-        f"3️⃣ Нажми <b>🌐 Домены</b> → <b>➕ Добавить домен</b>\n"
-        f"4️⃣ Введи домен: <code>target.com</code>\n"
-        f"5️⃣ Нажми <b>▶️ Скан</b>\n\n"
-        f"Выбери программу или создай новую:"
+        f"1️⃣ ➕ Новая программа → введи название\n"
+        f"2️⃣ Программа → 🌐 Домены → ➕ Добавить домен\n"
+        f"3️⃣ Введи домен: <code>target.com</code>\n"
+        f"4️⃣ ▶️ Скан\n\n"
+        f"Выбери программу:"
     )
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb_main())
+    await update.message.reply_text(
+        text, parse_mode="HTML", reply_markup=kb_main()
+    )
     return ST_MAIN
 
 
@@ -309,8 +287,7 @@ async def show_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"<b>Программы Bug Bounty</b>\n"
         f"Программ: {len(progs)}  |  Доменов: {total_d}  |  Активных: {len(_active_scans)}\n\n"
         f"Выбери программу:",
-        parse_mode="HTML",
-        reply_markup=kb_main()
+        parse_mode="HTML", reply_markup=kb_main()
     )
     return ST_MAIN
 
@@ -326,35 +303,31 @@ async def show_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_MAIN
     scanning = any(k.startswith(f"{name}:") for k in _active_scans)
     doms = prog.get("domains", [])
-    hdrs = prog.get("headers", {})
     cron = _load_cron().get(name, {})
-    status = "🔄 Сканируется..." if scanning else "⚫ Готово"
     text = (
         f"<b>📁 {name}</b>\n\n"
-        f"Статус: {status}\n"
+        f"Статус: {'🔄 Сканируется...' if scanning else '⚫ Готово'}\n"
         f"Доменов: <b>{len(doms)}</b>\n"
-        f"Заголовков: {len(hdrs)}\n"
-        f"Rate limit: {prog.get('rate_limit', 30)} req/s\n"
-        f"Cron: {cron.get('interval_hours','нет')}ч\n"
+        f"Заголовков: {len(prog.get('headers', {}))}\n"
+        f"Rate: {prog.get('rate_limit', 30)} req/s\n"
+        f"Cron: {cron.get('interval_hours', 'нет')}ч\n"
     )
     if doms:
         text += "\n<b>Домены:</b>\n" + "\n".join(f"  • {d}" for d in sorted(doms)[:10])
-        if len(doms) > 10: text += f"\n  ... и ещё {len(doms)-10}"
+        if len(doms) > 10: text += f"\n  ... +{len(doms)-10}"
     else:
-        text += "\n⚠️ <b>Нет доменов!</b> Нажми \"🌐 Домены\" → \"➕ Добавить домен\""
+        text += "\n⚠️ <b>Нет доменов!</b>\nНажми 🌐 Домены → ➕ Добавить домен"
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_prog(name))
     return ST_PROG
 
 
-# ── New program ────────────────────────────────────────────────
 async def start_new_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await q.edit_message_text(
         "<b>➕ Новая программа Bug Bounty</b>\n\n"
-        "Введи название программы:\n"
-        "<i>Примеры: hackerone_company, bugcrowd_target, vk_bb</i>\n\n"
-        "💡 После создания сразу добавишь домены",
+        "Введи название:\n"
+        "<i>Пример: hackerone_company, bugcrowd_target</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="BACK")]])
     )
@@ -364,7 +337,7 @@ async def start_new_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_new_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = update.message.text.strip().replace(" ", "_")
     if not name or len(name) > 60:
-        await update.message.reply_text("❌ Неверное название (макс. 60 символов)")
+        await update.message.reply_text("❌ Неверное название")
         return ST_ADD_PROG
     cfg = _load()
     if name in cfg["programs"]:
@@ -373,11 +346,9 @@ async def handle_new_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg["programs"][name] = _default_prog()
     _save(cfg)
     context.user_data["prog"] = name
-    # Сразу переходим к добавлению доменов!
     await update.message.reply_text(
         f"✅ Программа <b>{name}</b> создана!\n\n"
-        f"Теперь добавь первый домен.\n"
-        f"Введи домен (без https://):\n"
+        f"Теперь добавь домены.\nВведи домен (без https://):\n"
         f"<i>Пример: target.com</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⏭ Пропустить", callback_data=f"P:{name}")]])
@@ -385,7 +356,6 @@ async def handle_new_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ST_ADD_DOMAIN
 
 
-# ── Domains ────────────────────────────────────────────────────
 async def show_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -394,10 +364,7 @@ async def show_domains(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = get_prog(name) or {}
     doms = prog.get("domains", [])
     text = f"<b>🌐 Домены — {name}</b>\n\n"
-    if doms:
-        text += "\n".join(f"• {d}" for d in sorted(doms))
-    else:
-        text += "<i>Нет доменов</i>\n\nДобавь домены для сканирования:"
+    text += ("\n".join(f"• {d}" for d in sorted(doms))) if doms else "<i>Нет доменов</i>"
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_domains(name))
     return ST_PROG
 
@@ -409,9 +376,8 @@ async def start_add_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["prog"] = name
     await q.edit_message_text(
         f"<b>➕ Добавить домен в {name}</b>\n\n"
-        f"Введи домен (один за раз):\n"
-        f"<i>Примеры: target.com, sub.target.com, api.target.com</i>\n\n"
-        f"Без https:// — просто доменное имя",
+        f"Введи домен (без https://):\n"
+        f"<i>Пример: target.com</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"DOM:{name}")]])
     )
@@ -423,27 +389,22 @@ async def handle_add_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     domain = raw.replace("https://","").replace("http://","").strip("/")
     name = context.user_data.get("prog")
     if not domain or "." not in domain or not name:
-        await update.message.reply_text("❌ Неверный домен (нужна точка, напр. target.com)")
+        await update.message.reply_text("❌ Неверный домен (напр. target.com)")
         return ST_ADD_DOMAIN
     cfg = _load()
     if name not in cfg["programs"]:
         await update.message.reply_text("❌ Программа не найдена")
         return ST_MAIN
     if domain in cfg["programs"][name]["domains"]:
-        await update.message.reply_text(f"⚠️ {domain} уже добавлен")
-    else:
-        cfg["programs"][name]["domains"].append(domain)
-        _save(cfg)
-        await update.message.reply_text(
-            f"✅ <code>{domain}</code> добавлен!\n\n"
-            f"Добавить ещё один домен или нажми кнопку:",
-            parse_mode="HTML",
-            reply_markup=kb_domains(name)
-        )
+        await update.message.reply_text(f"⚠️ {domain} уже добавлен",
+                                         reply_markup=kb_domains(name))
         return ST_PROG
+    cfg["programs"][name]["domains"].append(domain)
+    _save(cfg)
     await update.message.reply_text(
-        f"Домены в {name}:",
-        reply_markup=kb_domains(name)
+        f"✅ <code>{domain}</code> добавлен!\n"
+        f"Добавить ещё или нажми кнопку ниже:",
+        parse_mode="HTML", reply_markup=kb_domains(name)
     )
     return ST_PROG
 
@@ -459,12 +420,11 @@ async def del_domain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prog = get_prog(name) or {}
     doms = prog.get("domains", [])
     text = f"<b>🌐 Домены — {name}</b>\n\n"
-    text += "\n".join(f"• {d}" for d in sorted(doms)) if doms else "<i>Нет доменов</i>"
+    text += ("\n".join(f"• {d}" for d in sorted(doms))) if doms else "<i>Нет доменов</i>"
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_domains(name))
     return ST_PROG
 
 
-# ── Headers ────────────────────────────────────────────────────
 async def show_headers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -479,11 +439,10 @@ async def show_headers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text += (
             "<i>Нет заголовков</i>\n\n"
-            "Заголовки используются чтобы не получить бан:\n"
+            "Примеры:\n"
             "<code>Authorization: Bearer TOKEN</code>\n"
             "<code>X-Bug-Bounty: @yourusername</code>\n"
-            "<code>Cookie: session=abc123</code>\n"
-            "<code>X-Forwarded-For: 1.2.3.4</code>"
+            "<code>Cookie: session=abc123</code>"
         )
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_headers(name))
     return ST_PROG
@@ -497,7 +456,7 @@ async def start_add_header(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         f"<b>➕ Новый заголовок для {name}</b>\n\n"
         f"Введи <b>имя</b> заголовка:\n"
-        f"<i>Примеры: Authorization, X-Bug-Bounty, Cookie</i>",
+        f"<i>Пример: Authorization</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data=f"HDR:{name}")]])
     )
@@ -511,8 +470,7 @@ async def handle_hdr_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ST_ADD_HDR_KEY
     context.user_data["hdr_key"] = key
     await update.message.reply_text(
-        f"Заголовок: <code>{key}</code>\n\nТеперь введи значение:",
-        parse_mode="HTML"
+        f"Заголовок: <code>{key}</code>\n\nВведи значение:", parse_mode="HTML"
     )
     return ST_ADD_HDR_VAL
 
@@ -528,9 +486,8 @@ async def handle_hdr_val(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg["programs"][name]["headers"][key] = val
     _save(cfg)
     await update.message.reply_text(
-        f"✅ Заголовок сохранён:\n<code>{key}: {val[:60]}</code>",
-        parse_mode="HTML",
-        reply_markup=kb_headers(name)
+        f"✅ Сохранено:\n<code>{key}: {val[:60]}</code>",
+        parse_mode="HTML", reply_markup=kb_headers(name)
     )
     return ST_PROG
 
@@ -552,7 +509,6 @@ async def del_header(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ST_PROG
 
 
-# ── Rate limit ────────────────────────────────────────────────
 async def show_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -563,11 +519,10 @@ async def show_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.edit_message_text(
         f"<b>⚡ Rate limit — {name}</b>\n\n"
         f"Текущий: <b>{rate}</b> req/s\n\n"
-        f"Рекомендации:\n"
-        f"• 10 — очень осторожно (не забанят)\n"
-        f"• 30 — стандарт (default)\n"
-        f"• 50 — быстро (риск блокировки)\n\n"
-        f"Введи новое значение (1-100):",
+        f"• 10 — осторожно (не забанят)\n"
+        f"• 30 — стандарт\n"
+        f"• 50 — быстро (риск бана)\n\n"
+        f"Введи число (1-100):",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data=f"P:{name}")]])
     )
@@ -587,13 +542,11 @@ async def handle_rate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _save(cfg)
     await update.message.reply_text(
         f"✅ Rate limit: <b>{rate}</b> req/s",
-        parse_mode="HTML",
-        reply_markup=kb_prog(name)
+        parse_mode="HTML", reply_markup=kb_prog(name)
     )
     return ST_PROG
 
 
-# ── Scan ──────────────────────────────────────────────────────
 async def start_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -606,12 +559,9 @@ async def start_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id
     await q.edit_message_text(
         f"▶️ <b>Скан запущен — {name}</b>\n\n"
-        f"Доменов: {len(doms)}\n"
-        f"Rate: {prog.get('rate_limit',30)} req/s\n"
-        f"Заголовков: {len(prog.get('headers',{}))}\n\n"
-        f"Результаты придут в Telegram по завершении каждого домена.",
-        parse_mode="HTML",
-        reply_markup=kb_prog(name)
+        f"Доменов: {len(doms)}  |  Rate: {prog.get('rate_limit',30)} req/s\n"
+        f"Результаты придут в Telegram по завершении.",
+        parse_mode="HTML", reply_markup=kb_prog(name)
     )
     for d in doms:
         asyncio.create_task(_run_scan(name, d, context, chat_id))
@@ -640,14 +590,12 @@ async def scan_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = q.message.chat_id
     total = sum(len(p.get("domains",[])) for p in progs.values())
     if total == 0:
-        await q.answer("⚠️ Нет доменов ни в одной программе!", show_alert=True)
+        await q.answer("⚠️ Нет доменов!", show_alert=True)
         return ST_MAIN
     await q.edit_message_text(
-        f"🔄 <b>Полное сканирование</b>\n\n"
-        f"Программ: {len(progs)}\nДоменов всего: {total}\n\n"
-        f"Результаты придут по завершении каждого домена.",
-        parse_mode="HTML",
-        reply_markup=kb_main()
+        f"🔄 <b>Полное сканирование</b>\n"
+        f"Программ: {len(progs)}  |  Доменов: {total}",
+        parse_mode="HTML", reply_markup=kb_main()
     )
     for pname, prog in progs.items():
         for d in prog.get("domains", []):
@@ -660,7 +608,7 @@ async def del_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     name = q.data.split(":", 1)[1]
     await q.edit_message_text(
-        f"🗑 <b>Удалить '{name}'?</b>\n\nВсе домены и заголовки будут удалены.",
+        f"🗑 <b>Удалить '{name}'?</b>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("✅ Да",  callback_data=f"CONFIRMDEL:{name}"),
@@ -677,42 +625,37 @@ async def confirm_del_prog(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cfg = _load()
     cfg["programs"].pop(name, None)
     _save(cfg)
-    # Удалить cron если есть
     cron_d = _load_cron()
     cron_d.pop(name, None)
     _save_cron(cron_d)
     await q.edit_message_text(
-        f"✅ Программа <b>{name}</b> удалена",
+        f"✅ <b>{name}</b> удалена",
         parse_mode="HTML", reply_markup=kb_main()
     )
     return ST_MAIN
 
 
-# ── CRON ──────────────────────────────────────────────────────
+# ── CRON
 async def show_cron_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if not HAS_SCHEDULER:
         await q.edit_message_text(
             "<b>🕐 Cron недоступен</b>\n\n"
-            "Установи apscheduler:\n"
             "<code>pip install apscheduler --break-system-packages</code>\n"
-            "Затем перезапусти бота.",
+            "Перезапусти бота.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Назад", callback_data="BACK")]])
         )
         return ST_MAIN
     cron_d = _load_cron()
-    cfg = _load()
-    progs = cfg.get("programs", {})
-    text = "<b>🕐 Cron — автоматическое сканирование</b>\n\n"
+    text = "<b>🕐 Cron — автосканирование</b>\n\n"
     if cron_d:
-        text += "Расписание:\n"
         for name, info in cron_d.items():
             text += f"• <b>{name}</b>: каждые {info.get('interval_hours','?')}ч\n"
     else:
         text += "<i>Нет расписаний</i>\n"
-    text += "\nНажми на программу чтобы настроить/отключить cron:"
+    text += "\nНажми на программу:"
     await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb_cron())
     return ST_MAIN
 
@@ -723,11 +666,8 @@ async def cron_set_prompt(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = q.data.split(":", 1)[1]
     context.user_data["cron_prog"] = name
     await q.edit_message_text(
-        f"<b>🕐 Cron для {name}</b>\n\n"
-        f"Введи интервал в часах:\n"
-        f"<i>Примеры: 6, 12, 24, 48</i>\n\n"
-        f"• 6ч — каждые 6 часов\n"
-        f"• 24ч — раз в сутки",
+        f"<b>🕐 Cron для {name}</b>\n\nВведи интервал в часах:\n"
+        f"<i>Пример: 6, 12, 24</i>",
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("◀️ Отмена", callback_data="CRONMENU")]])
     )
@@ -742,32 +682,22 @@ async def handle_cron_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except:
         await update.message.reply_text("❌ Введи число часов (1-168)")
         return ST_SET_CRON
-
     cron_d = _load_cron()
     cron_d[name] = {"interval_hours": hours, "chat_id": chat_id,
                     "created": datetime.now().isoformat()}
     _save_cron(cron_d)
-
-    # Зарегистрировать задачу в scheduler
     if HAS_SCHEDULER and scheduler:
         job_id = f"recon_{name}"
         try: scheduler.remove_job(job_id)
         except: pass
         scheduler.add_job(
-            _cron_scan_prog,
-            "interval",
-            hours=hours,
-            id=job_id,
-            args=[name, chat_id, context.application],
-            coalesce=True,
-            max_instances=1
+            _cron_scan_prog, "interval", hours=hours,
+            id=job_id, args=[name, chat_id, context.application],
+            coalesce=True, max_instances=1
         )
-
     await update.message.reply_text(
-        f"✅ Cron установлен: <b>{name}</b> каждые <b>{hours}ч</b>\n"
-        f"Первый запуск через {hours} часов.",
-        parse_mode="HTML",
-        reply_markup=kb_main()
+        f"✅ Cron: <b>{name}</b> каждые <b>{hours}ч</b>",
+        parse_mode="HTML", reply_markup=kb_main()
     )
     return ST_MAIN
 
@@ -784,75 +714,110 @@ async def cron_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except: pass
     await q.edit_message_text(
         f"✅ Cron для <b>{name}</b> отключён",
-        parse_mode="HTML",
-        reply_markup=kb_cron()
+        parse_mode="HTML", reply_markup=kb_cron()
     )
     return ST_MAIN
 
 
 async def _cron_scan_prog(prog_name: str, chat_id: int, app):
-    """Задача планировщика — запуск скана по расписанию"""
     prog = get_prog(prog_name)
     if not prog or not prog.get("domains"): return
     try:
-        await app.bot.send_message(
-            chat_id=chat_id,
-            text=f"🕐 <b>Cron скан</b>: {prog_name}",
-            parse_mode="HTML"
-        )
+        await app.bot.send_message(chat_id=chat_id,
+            text=f"🕐 <b>Cron скан</b>: {prog_name}", parse_mode="HTML")
     except: pass
     for domain in prog["domains"]:
-        headers_file = _make_headers_file(prog_name, prog.get("headers", {}))
+        hf = _make_headers_file(prog_name, prog.get("headers", {}))
         rate = prog.get("rate_limit", 30)
-        cmd = ["bash", str(RECON_SCRIPT), "-d", domain, "-o", str(RESULTS_DIR), "-t", str(rate)]
-        if headers_file: cmd += ["--headers-file", headers_file]
+        cmd = ["bash", str(RECON_SCRIPT), "-d", domain,
+               "-o", str(RESULTS_DIR), "-t", str(rate)]
+        if hf: cmd += ["--headers-file", hf]
         try:
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL
-            )
+                *cmd, stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL)
             await proc.wait()
         except Exception as e:
             logger.error(f"Cron scan error {domain}: {e}")
 
 
-# ── Misc ──────────────────────────────────────────────────────
+# ── Misc
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_auth(update.effective_user.id): return
     if not _active_scans:
         await update.message.reply_text("✅ Нет активных сканирований")
         return
-    lines = [f"🔄 <b>Активные сканы ({len(_active_scans)}):</b>"]
+    lines = [f"🔄 <b>Активные ({len(_active_scans)}):</b>"]
     for k in sorted(_active_scans):
         prog, domain = k.split(":", 1)
         lines.append(f"  • <b>{prog}</b>: <code>{domain}</code>")
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
 
+async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Принудительно остановить все активные сканы"""
+    if not is_auth(update.effective_user.id): return
+    count = 0
+    for k, proc in list(_active_scans.items()):
+        try: proc.terminate(); count += 1
+        except: pass
+    _active_scans.clear()
+    await update.message.reply_text(f"⏹ Остановлено сканов: {count}")
+
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "<b>BugBounty Recon Bot — Справка</b>\n\n"
-        "<b>Команды:</b>\n"
+        "<b>BugBounty Recon Bot v2.1</b>\n\n"
         "/start — главное меню\n"
         "/status — активные сканы\n"
+        "/kill — остановить все сканы\n"
         "/help — эта справка\n\n"
-        "<b>Как добавить домены:</b>\n"
+        "<b>Если кнопки не работают:</b>\n"
+        "<code>pkill -f bot.py && python3 bot.py</code>\n\n"
+        "<b>Добавление доменов:</b>\n"
         "1. /start → ➕ Новая программа\n"
-        "2. Введи название (напр. hackerone_target)\n"
-        "3. Введи домен (напр. target.com)\n"
-        "4. Нажми ▶️ Скан\n\n"
-        "<b>Заголовки (чтобы не забанили):</b>\n"
-        "Программа → 🔑 Заголовки → ➕ Добавить\n"
-        "Примеры:\n"
-        "<code>Authorization: Bearer TOKEN</code>\n"
-        "<code>X-Bug-Bounty: @username</code>\n",
+        "2. Введи название → автоматически спросит домен\n"
+        "3. ▶️ Скан\n",
         parse_mode="HTML"
     )
 
 
 async def nop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query: await update.callback_query.answer()
+
+
+# FIX v2.1: глобальный fallback для потерянных callback
+async def global_callback_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик для callback_query вне активной сессии ConversationHandler.
+    Происходит когда бот перезапустился и старые кнопки нажимают снова."""
+    q = update.callback_query
+    await q.answer("Сессия устарела. Напиши /start", show_alert=False)
+    try:
+        await q.edit_message_text(
+            "⚠️ Сессия устарела после перезапуска бота.\n"
+            "Напиши /start чтобы продолжить.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("▶️ Открыть меню", callback_data="RELOAD")
+            ]])
+        )
+    except: pass
+
+
+async def reload_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Восстановить меню по нажатию на кнопку в устаревшем сообщении."""
+    q = update.callback_query
+    await q.answer()
+    cfg = _load()
+    progs = cfg.get("programs", {})
+    total_d = sum(len(p.get("domains", [])) for p in progs.values())
+    try:
+        await q.edit_message_text(
+            f"<b>🕷️ BugBounty Recon Bot</b>\n"
+            f"Программ: {len(progs)}  |  Доменов: {total_d}\n\n"
+            f"Выбери программу:",
+            parse_mode="HTML", reply_markup=kb_main()
+        )
+    except: pass
 
 
 async def err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -867,32 +832,34 @@ def main():
     token = BOT_TOKEN or os.getenv("RECON_BOT_TOKEN", "")
     if not token:
         print("ERROR: BOT_TOKEN не задан!")
-        print("Заполни BOT_TOKEN в bot.py (~строка 40)")
+        print("Заполни BOT_TOKEN в bot.py (~строка 42)")
         print("Или: RECON_BOT_TOKEN=xxxx python3 bot.py")
         sys.exit(1)
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    app = Application.builder().token(token).build()
 
-    # Запустить scheduler если доступен
     if HAS_SCHEDULER:
         scheduler = AsyncIOScheduler()
-        # Восстановить задачи из cron файла
-        cron_data = _load_cron()
-        for prog_name, info in cron_data.items():
-            hours = info.get("interval_hours", 24)
+        for prog_name, info in _load_cron().items():
+            hours   = info.get("interval_hours", 24)
             chat_id = info.get("chat_id", 0)
             if chat_id:
-                scheduler.add_job(
-                    _cron_scan_prog,
-                    "interval",
-                    hours=hours,
-                    id=f"recon_{prog_name}",
-                    args=[prog_name, chat_id, app],
-                    coalesce=True,
-                    max_instances=1
-                )
-                logger.info(f"Cron restored: {prog_name} every {hours}h")
+                # Ссылку на app добавим после build
+                scheduler._pending = getattr(scheduler, "_pending", [])
+                scheduler._pending.append((prog_name, hours, chat_id))
+
+    app = Application.builder().token(token).build()
+
+    # Восстановить cron задачи с правильной ссылкой на app
+    if HAS_SCHEDULER and scheduler:
+        for prog_name, hours, chat_id in getattr(scheduler, "_pending", []):
+            scheduler.add_job(
+                _cron_scan_prog, "interval", hours=hours,
+                id=f"recon_{prog_name}",
+                args=[prog_name, chat_id, app],
+                coalesce=True, max_instances=1
+            )
+            logger.info(f"Cron restored: {prog_name} every {hours}h")
         scheduler.start()
 
     conv = ConversationHandler(
@@ -902,61 +869,85 @@ def main():
         ],
         states={
             ST_MAIN: [
-                CallbackQueryHandler(show_prog,      pattern=r"^P:"),
-                CallbackQueryHandler(start_new_prog, pattern=r"^NEW$"),
-                CallbackQueryHandler(scan_all,       pattern=r"^ALL$"),
-                CallbackQueryHandler(show_main,      pattern=r"^BACK$"),
-                CallbackQueryHandler(show_cron_menu, pattern=r"^CRONMENU$"),
-                CallbackQueryHandler(cron_set_prompt,pattern=r"^CRONSET:"),
-                CallbackQueryHandler(cron_del,       pattern=r"^CRONDEL:"),
+                CallbackQueryHandler(show_prog,       pattern=r"^P:"),
+                CallbackQueryHandler(start_new_prog,  pattern=r"^NEW$"),
+                CallbackQueryHandler(scan_all,        pattern=r"^ALL$"),
+                CallbackQueryHandler(show_main,       pattern=r"^BACK$"),
+                CallbackQueryHandler(show_cron_menu,  pattern=r"^CRONMENU$"),
+                CallbackQueryHandler(cron_set_prompt, pattern=r"^CRONSET:"),
+                CallbackQueryHandler(cron_del,        pattern=r"^CRONDEL:"),
+                CallbackQueryHandler(reload_menu,     pattern=r"^RELOAD$"),
             ],
             ST_PROG: [
-                CallbackQueryHandler(show_main,       pattern=r"^BACK$"),
-                CallbackQueryHandler(show_prog,       pattern=r"^P:"),
-                CallbackQueryHandler(show_domains,    pattern=r"^DOM:"),
-                CallbackQueryHandler(show_headers,    pattern=r"^HDR:"),
-                CallbackQueryHandler(show_rate,       pattern=r"^RATE:"),
-                CallbackQueryHandler(start_add_domain,pattern=r"^ADDD:"),
-                CallbackQueryHandler(del_domain,      pattern=r"^DELD:"),
-                CallbackQueryHandler(start_add_header,pattern=r"^ADDH:"),
-                CallbackQueryHandler(del_header,      pattern=r"^DELH:"),
-                CallbackQueryHandler(start_scan,      pattern=r"^SCAN:"),
-                CallbackQueryHandler(stop_scan,       pattern=r"^STOP:"),
-                CallbackQueryHandler(del_prog,        pattern=r"^DELPROG:"),
-                CallbackQueryHandler(confirm_del_prog,pattern=r"^CONFIRMDEL:"),
-                CallbackQueryHandler(nop,             pattern=r"^NOP$"),
+                CallbackQueryHandler(show_main,        pattern=r"^BACK$"),
+                CallbackQueryHandler(show_prog,        pattern=r"^P:"),
+                CallbackQueryHandler(show_domains,     pattern=r"^DOM:"),
+                CallbackQueryHandler(show_headers,     pattern=r"^HDR:"),
+                CallbackQueryHandler(show_rate,        pattern=r"^RATE:"),
+                CallbackQueryHandler(start_add_domain, pattern=r"^ADDD:"),
+                CallbackQueryHandler(del_domain,       pattern=r"^DELD:"),
+                CallbackQueryHandler(start_add_header, pattern=r"^ADDH:"),
+                CallbackQueryHandler(del_header,       pattern=r"^DELH:"),
+                CallbackQueryHandler(start_scan,       pattern=r"^SCAN:"),
+                CallbackQueryHandler(stop_scan,        pattern=r"^STOP:"),
+                CallbackQueryHandler(del_prog,         pattern=r"^DELPROG:"),
+                CallbackQueryHandler(confirm_del_prog, pattern=r"^CONFIRMDEL:"),
+                CallbackQueryHandler(nop,              pattern=r"^NOP$"),
             ],
-            ST_ADD_PROG:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_prog),
-                            CallbackQueryHandler(show_main, pattern=r"^BACK$")],
-            ST_ADD_DOMAIN: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_domain),
-                            CallbackQueryHandler(show_domains, pattern=r"^DOM:"),
-                            CallbackQueryHandler(show_prog,    pattern=r"^P:")],
-            ST_ADD_HDR_KEY:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_hdr_key),
-                            CallbackQueryHandler(show_headers,  pattern=r"^HDR:")],
-            ST_ADD_HDR_VAL:[MessageHandler(filters.TEXT & ~filters.COMMAND, handle_hdr_val)],
-            ST_SET_RATE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rate),
-                            CallbackQueryHandler(show_prog, pattern=r"^P:")],
-            ST_SET_CRON:   [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cron_set),
-                            CallbackQueryHandler(show_cron_menu, pattern=r"^CRONMENU$")],
+            ST_ADD_PROG:   [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_new_prog),
+                CallbackQueryHandler(show_main, pattern=r"^BACK$"),
+            ],
+            ST_ADD_DOMAIN: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_add_domain),
+                CallbackQueryHandler(show_domains, pattern=r"^DOM:"),
+                CallbackQueryHandler(show_prog,    pattern=r"^P:"),
+            ],
+            ST_ADD_HDR_KEY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_hdr_key),
+                CallbackQueryHandler(show_headers, pattern=r"^HDR:"),
+            ],
+            ST_ADD_HDR_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_hdr_val)],
+            ST_SET_RATE:    [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_rate),
+                CallbackQueryHandler(show_prog, pattern=r"^P:"),
+            ],
+            ST_SET_CRON:    [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cron_set),
+                CallbackQueryHandler(show_cron_menu, pattern=r"^CRONMENU$"),
+            ],
         },
         fallbacks=[
             CommandHandler("start",  cmd_start),
             CommandHandler("status", cmd_status),
+            CommandHandler("kill",   cmd_kill),
             CommandHandler("help",   cmd_help),
         ],
     )
 
     app.add_handler(conv)
+    # FIX v2.1: глобальный обработчик для устаревших кнопок (RELOAD и всё остальное)
+    app.add_handler(CallbackQueryHandler(reload_menu,             pattern=r"^RELOAD$"))
+    app.add_handler(CallbackQueryHandler(global_callback_fallback))  # ловит ВСЁ остальное
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("kill",   cmd_kill))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_error_handler(err_handler)
 
-    print(f"BugBounty Recon Bot v2.0 запущен")
+    print(f"BugBounty Recon Bot v2.1 запущен")
     print(f"Config:    {PROGRAMS_FILE}")
     print(f"Script:    {RECON_SCRIPT}")
-    print(f"Scheduler: {'OK' if HAS_SCHEDULER else 'нет (pip install apscheduler)'}")
+    print(f"Scheduler: {'OK' if HAS_SCHEDULER else 'нет'}")
     print(f"Auth:      {'ALL (dev)' if not AUTHORIZED_USERS else AUTHORIZED_USERS}")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print(f"")
+    print(f"Если кнопки не работают — убей старый процесс:")
+    print(f"  pkill -f bot.py && python3 bot.py")
+
+    # FIX v2.1: drop_pending_updates=True — игнорировать апдейты накопившиеся пока бот не работал
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True  # <- ключевой фикс!
+    )
 
 
 if __name__ == "__main__":
