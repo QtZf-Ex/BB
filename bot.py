@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-BugBounty Recon Bot v2.1
+BugBounty Recon Bot v2.2
 
-FIX v2.1:
-  - drop_pending_updates=True: не обрабатывать старые апдейты после рестарта
-  - Глобальный обработчик потерянных callback_query (кнопки от старых сессий)
-  - Команда /kill для остановки зависших сканов
-  - Явная инструкция при старте: как убить старый процесс бота
+FIX v2.2:
+  - ГЛАВНЫЙ ФИX: scheduler.start() перенесён в post_init hook
+    (AsyncIOScheduler требует уже запущенный event loop)
+  - drop_pending_updates=True
+  - Глобальный fallback для устаревших кнопок
 
 Установка:
   pip install python-telegram-bot apscheduler --break-system-packages
 
 Запуск:
-  # ВАЖНО: убить старый процесс перед запуском!
   pkill -f bot.py
   python3 bot.py
 """
@@ -45,7 +44,7 @@ except ImportError:
     print("      pip install apscheduler --break-system-packages")
 
 # =================================================================
-#  НАСТРОЙКИ
+#  НАСТРОЙКИ — ЗАПОЛНИ ЗДЕСЬ
 # =================================================================
 BOT_TOKEN = os.getenv("RECON_BOT_TOKEN", "")  # <- или вставь токен сюда
 
@@ -72,7 +71,8 @@ logger = logging.getLogger(__name__)
 ) = range(8)
 
 _active_scans: dict = {}
-scheduler: Optional[object] = None
+# Scheduler создаётся глобально, стартует в post_init
+_scheduler: Optional[AsyncIOScheduler] = None if not HAS_SCHEDULER else AsyncIOScheduler()
 
 
 # =================================================================
@@ -260,7 +260,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     progs = cfg.get("programs", {})
     total_d = sum(len(p.get("domains", [])) for p in progs.values())
     text = (
-        f"<b>🕷️ BugBounty Recon Bot v2.1</b>\n"
+        f"<b>🕷️ BugBounty Recon Bot v2.2</b>\n"
         f"Привет, {user.first_name}!\n\n"
         f"📁 Программ: {len(progs)}  |  🌐 Доменов: {total_d}\n"
         f"🔄 Активных сканов: {len(_active_scans)}\n\n"
@@ -686,11 +686,11 @@ async def handle_cron_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cron_d[name] = {"interval_hours": hours, "chat_id": chat_id,
                     "created": datetime.now().isoformat()}
     _save_cron(cron_d)
-    if HAS_SCHEDULER and scheduler:
+    if HAS_SCHEDULER and _scheduler:
         job_id = f"recon_{name}"
-        try: scheduler.remove_job(job_id)
+        try: _scheduler.remove_job(job_id)
         except: pass
-        scheduler.add_job(
+        _scheduler.add_job(
             _cron_scan_prog, "interval", hours=hours,
             id=job_id, args=[name, chat_id, context.application],
             coalesce=True, max_instances=1
@@ -709,8 +709,8 @@ async def cron_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cron_d = _load_cron()
     cron_d.pop(name, None)
     _save_cron(cron_d)
-    if HAS_SCHEDULER and scheduler:
-        try: scheduler.remove_job(f"recon_{name}")
+    if HAS_SCHEDULER and _scheduler:
+        try: _scheduler.remove_job(f"recon_{name}")
         except: pass
     await q.edit_message_text(
         f"✅ Cron для <b>{name}</b> отключён",
@@ -755,7 +755,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Принудительно остановить все активные сканы"""
     if not is_auth(update.effective_user.id): return
     count = 0
     for k, proc in list(_active_scans.items()):
@@ -767,7 +766,7 @@ async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "<b>BugBounty Recon Bot v2.1</b>\n\n"
+        "<b>BugBounty Recon Bot v2.2</b>\n\n"
         "/start — главное меню\n"
         "/status — активные сканы\n"
         "/kill — остановить все сканы\n"
@@ -776,8 +775,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<code>pkill -f bot.py && python3 bot.py</code>\n\n"
         "<b>Добавление доменов:</b>\n"
         "1. /start → ➕ Новая программа\n"
-        "2. Введи название → автоматически спросит домен\n"
-        "3. ▶️ Скан\n",
+        "2. Введи название\n"
+        "3. Введи домен (напр. target.com)\n"
+        "4. ▶️ Скан\n",
         parse_mode="HTML"
     )
 
@@ -786,10 +786,8 @@ async def nop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query: await update.callback_query.answer()
 
 
-# FIX v2.1: глобальный fallback для потерянных callback
 async def global_callback_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик для callback_query вне активной сессии ConversationHandler.
-    Происходит когда бот перезапустился и старые кнопки нажимают снова."""
+    """Fallback для кнопок от устаревших сессий (после перезапуска бота)."""
     q = update.callback_query
     await q.answer("Сессия устарела. Напиши /start", show_alert=False)
     try:
@@ -804,7 +802,7 @@ async def global_callback_fallback(update: Update, context: ContextTypes.DEFAULT
 
 
 async def reload_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Восстановить меню по нажатию на кнопку в устаревшем сообщении."""
+    """Восстановить меню из устаревшего сообщения."""
     q = update.callback_query
     await q.answer()
     cfg = _load()
@@ -825,10 +823,32 @@ async def err_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =================================================================
-# MAIN
+# MAIN — FIX v2.2: scheduler стартует через post_init hook
 # =================================================================
+async def _post_init(app: Application) -> None:
+    """Вызывается ПОСЛЕ запуска event loop — безопасное место для scheduler.start()"""
+    if not HAS_SCHEDULER or _scheduler is None:
+        return
+    # Добавить cron задачи восстановленные из файла
+    for prog_name, info in _load_cron().items():
+        hours   = info.get("interval_hours", 24)
+        chat_id = info.get("chat_id", 0)
+        if chat_id:
+            job_id = f"recon_{prog_name}"
+            try: _scheduler.remove_job(job_id)
+            except: pass
+            _scheduler.add_job(
+                _cron_scan_prog, "interval", hours=hours,
+                id=job_id,
+                args=[prog_name, chat_id, app],
+                coalesce=True, max_instances=1
+            )
+            logger.info(f"Cron restored: {prog_name} every {hours}h")
+    _scheduler.start()
+    logger.info("APScheduler started")
+
+
 def main():
-    global scheduler
     token = BOT_TOKEN or os.getenv("RECON_BOT_TOKEN", "")
     if not token:
         print("ERROR: BOT_TOKEN не задан!")
@@ -838,29 +858,13 @@ def main():
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
-    if HAS_SCHEDULER:
-        scheduler = AsyncIOScheduler()
-        for prog_name, info in _load_cron().items():
-            hours   = info.get("interval_hours", 24)
-            chat_id = info.get("chat_id", 0)
-            if chat_id:
-                # Ссылку на app добавим после build
-                scheduler._pending = getattr(scheduler, "_pending", [])
-                scheduler._pending.append((prog_name, hours, chat_id))
-
-    app = Application.builder().token(token).build()
-
-    # Восстановить cron задачи с правильной ссылкой на app
-    if HAS_SCHEDULER and scheduler:
-        for prog_name, hours, chat_id in getattr(scheduler, "_pending", []):
-            scheduler.add_job(
-                _cron_scan_prog, "interval", hours=hours,
-                id=f"recon_{prog_name}",
-                args=[prog_name, chat_id, app],
-                coalesce=True, max_instances=1
-            )
-            logger.info(f"Cron restored: {prog_name} every {hours}h")
-        scheduler.start()
+    # FIX v2.2: передаём post_init в builder — стартует ПОСЛЕ event loop
+    app = (
+        Application.builder()
+        .token(token)
+        .post_init(_post_init)   # <- scheduler.start() здесь, event loop уже работает
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[
@@ -926,27 +930,26 @@ def main():
     )
 
     app.add_handler(conv)
-    # FIX v2.1: глобальный обработчик для устаревших кнопок (RELOAD и всё остальное)
+    # Глобальные обработчики — вне ConversationHandler
     app.add_handler(CallbackQueryHandler(reload_menu,             pattern=r"^RELOAD$"))
-    app.add_handler(CallbackQueryHandler(global_callback_fallback))  # ловит ВСЁ остальное
+    app.add_handler(CallbackQueryHandler(global_callback_fallback))  # ловит всё остальное
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("kill",   cmd_kill))
     app.add_handler(CommandHandler("help",   cmd_help))
     app.add_error_handler(err_handler)
 
-    print(f"BugBounty Recon Bot v2.1 запущен")
+    print(f"BugBounty Recon Bot v2.2 запущен")
     print(f"Config:    {PROGRAMS_FILE}")
     print(f"Script:    {RECON_SCRIPT}")
-    print(f"Scheduler: {'OK' if HAS_SCHEDULER else 'нет'}")
+    print(f"Scheduler: {'OK (стартует в post_init)' if HAS_SCHEDULER else 'нет'}")
     print(f"Auth:      {'ALL (dev)' if not AUTHORIZED_USERS else AUTHORIZED_USERS}")
-    print(f"")
-    print(f"Если кнопки не работают — убей старый процесс:")
-    print(f"  pkill -f bot.py && python3 bot.py")
+    print()
+    print("Если кнопки не работают:")
+    print("  pkill -f bot.py && python3 bot.py")
 
-    # FIX v2.1: drop_pending_updates=True — игнорировать апдейты накопившиеся пока бот не работал
     app.run_polling(
         allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True  # <- ключевой фикс!
+        drop_pending_updates=True
     )
 
 
